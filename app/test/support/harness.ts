@@ -85,11 +85,14 @@ export type JournalEntry =
 
 export class MemoryStore implements KeyValueStore {
   readonly data = new Map<string, string>();
+  /** When true every write rejects, as a full or broken device store would. */
+  failWrites = false;
   constructor(private readonly journal: JournalEntry[]) {}
   async getItem(key: string): Promise<string | null> {
     return this.data.get(key) ?? null;
   }
   async setItem(key: string, value: string): Promise<void> {
+    if (this.failWrites) throw new Error('storage write failed');
     this.journal.push({ kind: 'store.set', value });
     this.data.set(key, value);
   }

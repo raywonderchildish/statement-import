@@ -1,6 +1,7 @@
 import type { ImportRecord, JobStatus, JobView, RecurringItem } from './types';
 
 const STATUSES: ReadonlyArray<JobStatus> = ['queued', 'processing', 'ready', 'deleting', 'deleted'];
+const PHASES: ReadonlyArray<string> = ['sending', 'uncertain', 'tracking', 'rejected', 'missing'];
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -50,5 +51,10 @@ export function parseRecord(raw: string | null): ImportRecord | null {
   if (!isObject(value) || value.schema !== 1) return null;
   if (typeof value.importKey !== 'string' || typeof value.phase !== 'string') return null;
   if (typeof value.revision !== 'number' || typeof value.fileName !== 'string') return null;
+  if (!PHASES.includes(value.phase)) return null;
+  if (value.status !== null && !STATUSES.includes(value.status as JobStatus)) return null;
+  if (value.jobId !== null && typeof value.jobId !== 'string') return null;
+  if (value.copyRef !== null && typeof value.copyRef !== 'string') return null;
+  if (value.phase === 'tracking' && typeof value.jobId !== 'string') return null;
   return value as unknown as ImportRecord;
 }

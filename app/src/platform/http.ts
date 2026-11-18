@@ -1,6 +1,7 @@
-import { File, UploadType } from 'expo-file-system';
+import { UploadType } from 'expo-file-system';
 
 import type { Http } from '../import';
+import { resolveRef } from './files';
 
 async function withTimeout<T>(timeoutMs: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
   const controller = new AbortController();
@@ -26,7 +27,7 @@ export const deviceHttp: Http = {
    */
   uploadFile: ({ url, headers, fileRef, timeoutMs }) =>
     withTimeout(timeoutMs, async signal => {
-      const result = await new File(fileRef).upload(url, {
+      const result = await resolveRef(fileRef).upload(url, {
         httpMethod: 'POST',
         uploadType: UploadType.BINARY_CONTENT,
         headers,

@@ -263,6 +263,71 @@ describe('leaving an uncertain import', () => {
   });
 });
 
+describe('edge cases found in review', () => {
+  it('sends nothing and leaves no trace when the key cannot be stored', async () => {
+    const engine = launch(world, mock.baseUrl);
+    const prepared = await engine.prepare({ ref: fixture('statement.csv'), name: 'statement.csv' });
+    if (!prepared.ok) throw new Error('fixture rejected');
+    world.store.failWrites = true;
+
+    await expect(engine.confirm(prepared.candidate)).rejects.toThrow();
+    expect(engine.getSnapshot().record).toBeNull();
+    expect(world.requests('POST')).toEqual([]);
+    expect((await mock.state()).stats.createRequests).toBe(0);
+    expect(await world.files.listPrivate()).toEqual([]);
+  });
+
+  it('treats an unexpected success code on create as unknown, not as a refusal', async () => {
+    world.intercept = entry => (entry.method === 'POST' ? { status: 200, body: '{}' } : undefined);
+    const engine = launch(world, mock.baseUrl);
+    await startImport(engine, 'statement.csv');
+    expect(record(engine)).toMatchObject({ phase: 'uncertain', errorCode: 'bad_response' });
+    expect(record(engine).copyRef).not.toBeNull();
+    await expect(engine.dismiss()).rejects.toThrow();
+  });
+
+  it('keeps the key for clean-up when the copy needed for a retry has vanished', async () => {
+    world.intercept = entry => {
+      if (entry.method === 'POST') throw new Error('connection dropped');
+      return undefined;
+    };
+    const engine = launch(world, mock.baseUrl);
+    await startImport(engine, 'statement.csv');
+    const { importKey, copyRef } = record(engine);
+    world.intercept = null;
+    await world.files.remove(copyRef ?? '');
+
+    await engine.retry();
+    expect(record(engine)).toMatchObject({ phase: 'rejected', errorCode: 'copy_missing' });
+    expect(world.store.data.get(ABANDONED_STORAGE_KEY)).toContain(importKey);
+    expect(world.requests('POST')).toEqual([]);
+  });
+
+  it('ignores a stored record with an unknown phase instead of showing a dead-end screen', async () => {
+    const first = launch(world, mock.baseUrl);
+    await startImport(first, 'statement.csv');
+    const broken = { ...storedRecord(), phase: 'archived' };
+    world.store.data.set(RECORD_STORAGE_KEY, JSON.stringify(broken));
+
+    const relaunched = launch(world, mock.baseUrl);
+    await relaunched.restore();
+    expect(relaunched.getSnapshot().record).toBeNull();
+  });
+
+  it('can show the stored job without waiting for the abandoned clean-up', async () => {
+    const first = launch(world, mock.baseUrl);
+    await startImport(first, 'statement.csv');
+    world.store.data.set(ABANDONED_STORAGE_KEY, JSON.stringify([{ importKey: 'never-created-key', deleteKey: 'delete-key-1' }]));
+
+    const relaunched = launch(world, mock.baseUrl);
+    await relaunched.restore({ cleanUp: false });
+    expect(record(relaunched).phase).toBe('tracking');
+    expect(world.store.data.has(ABANDONED_STORAGE_KEY)).toBe(true);
+    await relaunched.cleanUpAbandoned();
+    expect(world.store.data.has(ABANDONED_STORAGE_KEY)).toBe(false);
+  });
+});
+
 describe('stale_status', () => {
   it('keeps ready/revision 3 when processing/revision 2 arrives afterwards', async () => {
     const engine = launch(world, mock.baseUrl);

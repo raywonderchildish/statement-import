@@ -18,7 +18,7 @@ export function ImportScreen({ engine }: { engine: ImportEngine }) {
         <ScrollView contentContainerStyle={layout.content} keyboardShouldPersistTaps="handled">
           <Title>Импорт выписки</Title>
           <Content controller={controller} />
-          <Diagnostics lastSync={controller.lastSync} />
+          {__DEV__ && <Diagnostics lastSync={controller.lastSync} />}
         </ScrollView>
       </Frame>
     </SafeAreaProvider>

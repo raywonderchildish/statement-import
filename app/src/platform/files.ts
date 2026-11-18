@@ -12,6 +12,13 @@ import { FileTooLargeError, type FileStore } from '../import';
 const PRIVATE_DIRECTORY = 'statement-import';
 const COPY_CHUNK_BYTES = 256 * 1024;
 
+/**
+ * Private copies are referred to by name, not by absolute path: the app's sandbox
+ * path changes when the app is updated, and a persisted absolute path would then
+ * point nowhere and the copy would look like an orphan.
+ */
+const PRIVATE_PREFIX = 'private:';
+
 function privateDirectory(): Directory {
   const directory = new Directory(Paths.cache, PRIVATE_DIRECTORY);
   if (!directory.exists) directory.create({ intermediates: true, idempotent: true });
@@ -55,13 +62,20 @@ function pickerInboxFiles(): string[] {
   }
 }
 
+/** Turns an engine ref into a file: one of our named copies, or a picked document URI. */
+export function resolveRef(ref: string): File {
+  return ref.startsWith(PRIVATE_PREFIX)
+    ? new File(privateDirectory(), ref.slice(PRIVATE_PREFIX.length))
+    : new File(ref);
+}
+
 /** Lets the UI thread breathe between chunks of a long copy. */
 const yieldToUi = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0));
 
 export const deviceFiles: FileStore = {
   async size(ref) {
     try {
-      const file = new File(ref);
+      const file = resolveRef(ref);
       return file.exists ? file.size : null;
     } catch {
       return null;
@@ -69,7 +83,7 @@ export const deviceFiles: FileStore = {
   },
 
   async readHead(ref, length) {
-    const handle = new File(ref).open(FileMode.ReadOnly);
+    const handle = resolveRef(ref).open(FileMode.ReadOnly);
     try {
       return await handle.readBytes(length);
     } finally {
@@ -83,7 +97,8 @@ export const deviceFiles: FileStore = {
    * copy stops as soon as the limit is crossed, whatever size the provider claimed.
    */
   async copyToPrivate(sourceRef, maxBytes) {
-    const target = new File(privateDirectory(), `${randomUUID()}.tmp`);
+    const name = `${randomUUID()}.tmp`;
+    const target = new File(privateDirectory(), name);
     target.create();
     let input: ReturnType<File['open']> | null = null;
     let output: ReturnType<File['open']> | null = null;
@@ -99,7 +114,7 @@ export const deviceFiles: FileStore = {
         await output.writeBytes(chunk);
         await yieldToUi();
       }
-      return target.uri;
+      return PRIVATE_PREFIX + name;
     } catch (error) {
       closeQuietly(output);
       output = null;
@@ -112,13 +127,13 @@ export const deviceFiles: FileStore = {
   },
 
   async remove(ref) {
-    deleteQuietly(new File(ref));
+    deleteQuietly(resolveRef(ref));
   },
 
   async listPrivate() {
     const copies = privateDirectory()
       .list()
-      .map(entry => entry.uri);
+      .map(entry => PRIVATE_PREFIX + entry.name);
     return [...copies, ...pickerInboxFiles()];
   },
 

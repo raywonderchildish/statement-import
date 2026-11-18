@@ -82,12 +82,14 @@ export class ImportEngine {
    * Loads the persisted operation and brings it up to date using GET requests only.
    * Never POSTs: an interrupted or lost create is looked up by its key.
    */
-  async restore(): Promise<Snapshot> {
+  async restore(options: { cleanUp?: boolean } = {}): Promise<Snapshot> {
     this.record = parseRecord(await this.deps.store.getItem(RECORD_STORAGE_KEY));
     this.result = null;
     this.publish();
     await this.sweepOrphanCopies();
-    await this.cleanUpAbandoned();
+    // The UI passes cleanUp: false and runs the clean-up in the background, so an
+    // unreachable server never delays showing the job the user already has.
+    if (options.cleanUp !== false) await this.cleanUpAbandoned();
     const record = this.record;
     if (!record) return this.snapshot;
     const key = record.importKey;
@@ -188,7 +190,15 @@ export class ImportEngine {
     };
     this.result = null;
     this.publish();
-    await this.persist(); // must be durable before the first byte leaves the device
+    try {
+      await this.persist(); // must be durable before the first byte leaves the device
+    } catch (error) {
+      // Nothing was sent. Without a durable key we must not send at all.
+      await this.removeFile(candidate.copyRef);
+      this.record = null;
+      this.publish();
+      throw error;
+    }
     this.log('record_persisted', { phase: 'sending' });
     await this.send(importKey);
   }
@@ -209,7 +219,9 @@ export class ImportEngine {
     const copyRef = current.copyRef;
     const copySize = copyRef === null ? null : await this.deps.files.size(copyRef).catch(() => null);
     if (copyRef === null || copySize !== current.fileSize) {
-      // Without the original bytes the same key cannot be reused safely.
+      // Without the original bytes the same key cannot be reused safely. A 404 only
+      // means "not found at that instant", so the key is kept for later clean-up.
+      await this.rememberAbandoned(key);
       await this.mutate(key, draft => {
         draft.phase = 'rejected';
         draft.errorCode = 'copy_missing';
@@ -240,9 +252,7 @@ export class ImportEngine {
     if ((await this.recoverByKey(key)) === 'found') return 'recovered';
     if (!this.current(key)) return 'abandoned';
 
-    const abandoned = await this.readAbandoned();
-    abandoned.push({ importKey: key, deleteKey: this.deps.newKey() });
-    await this.deps.store.setItem(ABANDONED_STORAGE_KEY, JSON.stringify(abandoned)); // before the record goes
+    await this.rememberAbandoned(key); // before the record goes
     this.log('import_abandoned');
     await this.clearRecord();
     return 'abandoned';
@@ -373,6 +383,13 @@ export class ImportEngine {
     this.log('record_cleared');
   }
 
+  private async rememberAbandoned(importKey: string): Promise<void> {
+    const abandoned = await this.readAbandoned();
+    if (abandoned.some(entry => entry.importKey === importKey)) return;
+    abandoned.push({ importKey, deleteKey: this.deps.newKey() });
+    await this.deps.store.setItem(ABANDONED_STORAGE_KEY, JSON.stringify(abandoned));
+  }
+
   private async readAbandoned(): Promise<AbandonedImport[]> {
     try {
       const value: unknown = JSON.parse((await this.deps.store.getItem(ABANDONED_STORAGE_KEY)) ?? '[]');
@@ -393,7 +410,7 @@ export class ImportEngine {
    * An entry is dropped only when the server says there is no such job or that
    * it is deleted; a job that exists gets a DELETE and is re-checked next launch.
    */
-  private async cleanUpAbandoned(): Promise<void> {
+  async cleanUpAbandoned(): Promise<void> {
     const abandoned = await this.readAbandoned();
     if (abandoned.length === 0) return;
     const remaining: AbandonedImport[] = [];
@@ -467,8 +484,10 @@ export class ImportEngine {
       await this.markUncertain(key, 'conflict', response.status);
       return;
     }
-    if (response.status >= 500 || response.status === 408 || response.status === 429) {
-      await this.markUncertain(key, 'server_unavailable', response.status);
+    const refused = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
+    if (!refused) {
+      // 5xx, timeouts, throttling, redirects, or a 2xx we do not understand: a job may exist.
+      await this.markUncertain(key, response.status >= 500 ? 'server_unavailable' : 'bad_response', response.status);
       return;
     }
     if (this.current(key)?.phase !== 'sending') return;
@@ -585,7 +604,10 @@ export class ImportEngine {
   private async dropCopy(key: string): Promise<void> {
     const record = this.current(key);
     if (!record || record.copyRef === null) return;
-    await this.removeFile(record.copyRef);
+    const copyRef = record.copyRef;
+    await this.removeFile(copyRef);
+    const remaining = await this.deps.files.size(copyRef).catch(() => null);
+    if (remaining !== null) return; // still on disk: keep the reference so the sweep retries
     await this.mutate(key, draft => {
       draft.copyRef = null;
     });

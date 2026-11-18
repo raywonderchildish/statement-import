@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { AppState } from 'react-native';
 
-import type { ApplyOutcome, Candidate, ImportEngine, RejectionReason } from '../import';
+import { EngineStateError, type ApplyOutcome, type Candidate, type ImportEngine, type RejectionReason } from '../import';
 import { pickStatement } from '../platform/picker';
 import { needsPolling } from './viewModel';
 
@@ -37,7 +37,15 @@ export function useImport(engine: ImportEngine) {
   }, []);
 
   useEffect(() => {
-    void run('restoring', async () => void (await engine.restore()), true);
+    void run(
+      'restoring',
+      async () => {
+        await engine.restore({ cleanUp: false });
+        // Deferred deletes for abandoned imports must not hold up the screen.
+        void engine.cleanUpAbandoned().catch(() => {});
+      },
+      true,
+    );
   }, [engine, run]);
 
   // Poll only while the server is still expected to change the job.
@@ -50,8 +58,10 @@ export function useImport(engine: ImportEngine) {
         try {
           const outcome = await engine.refresh();
           if (!cancelled) setLastSync(outcome);
-        } catch {
-          return; // the operation moved on; the effect restarts if polling is still needed
+        } catch (error) {
+          // The operation moved on: stop, the effect restarts if polling is still needed.
+          if (error instanceof EngineStateError) return;
+          // Anything else (for example a failed storage write) is retried on the next tick.
         }
         await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
       }
