@@ -102,6 +102,8 @@ export class MemoryStore implements KeyValueStore {
 /** Private temp directory on disk; copies are streamed with a hard byte cap. */
 export class NodeFiles implements FileStore {
   copies = 0;
+  /** Sources the engine reported it was done with, in order. */
+  readonly released: string[] = [];
   constructor(readonly privateDirectory: string, private readonly sizeKnown = true) {}
 
   async size(ref: string): Promise<number | null> {
@@ -148,6 +150,10 @@ export class NodeFiles implements FileStore {
 
   async remove(ref: string): Promise<void> {
     await unlink(ref).catch(() => {});
+  }
+
+  async releaseSource(sourceRef: string): Promise<void> {
+    this.released.push(sourceRef);
   }
 
   async listPrivate(): Promise<string[]> {

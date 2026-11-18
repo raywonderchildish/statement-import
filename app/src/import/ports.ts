@@ -29,8 +29,17 @@ export interface FileStore {
   copyToPrivate(sourceRef: string, maxBytes: number): Promise<string>;
   /** Idempotent: removing a missing file is not an error. */
   remove(ref: string): Promise<void>;
-  /** Every private temp copy currently on disk (used to sweep orphans after a crash). */
+  /**
+   * Every temp file the app owns on disk: its private copies and anything the
+   * system picker dropped into the app sandbox (used to sweep orphans after a crash).
+   */
   listPrivate(): Promise<string[]>;
+  /**
+   * Called once the engine is done reading a picked source. Must delete the source
+   * if it is a temporary copy inside the app sandbox (iOS puts picked documents in
+   * `tmp/<bundle>-Inbox`), and must do nothing for a document that lives elsewhere.
+   */
+  releaseSource(sourceRef: string): Promise<void>;
 }
 
 export interface HttpResponse {

@@ -21,7 +21,9 @@ export type LogEvent =
   | 'delete_confirmed'
   | 'copy_removed'
   | 'orphan_copy_removed'
-  | 'record_cleared';
+  | 'record_cleared'
+  | 'import_abandoned'
+  | 'abandoned_cleanup';
 
 export interface LogFields {
   phase?: string;

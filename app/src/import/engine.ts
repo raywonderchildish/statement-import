@@ -7,6 +7,14 @@ import type {
 import { encodeFileNameHeader, HEAD_BYTES, MAX_FILE_BYTES, validateFile } from './validate';
 
 export const RECORD_STORAGE_KEY = 'statement-import/record/v1';
+export const ABANDONED_STORAGE_KEY = 'statement-import/abandoned/v1';
+
+/** An import the user walked away from while its outcome was unknown. */
+interface AbandonedImport {
+  importKey: string;
+  /** Fixed up front so a later clean-up DELETE is idempotent across launches. */
+  deleteKey: string;
+}
 
 export interface EngineDeps {
   baseUrl: string;
@@ -40,6 +48,8 @@ export class EngineStateError extends Error {
  *    job is not already `deleted`, and its revision is not older than the one seen.
  *  - `deleted` is set only from a server answer saying `deleted`. A 202 on DELETE
  *    means `deleting`, a 404 means `missing`; neither is reported as deleted.
+ *  - Leaving an uncertain import never drops its key: the key is kept in a small
+ *    list and later launches look the job up and ask the server to delete it.
  */
 export class ImportEngine {
   private record: ImportRecord | null = null;
@@ -77,6 +87,7 @@ export class ImportEngine {
     this.result = null;
     this.publish();
     await this.sweepOrphanCopies();
+    await this.cleanUpAbandoned();
     const record = this.record;
     if (!record) return this.snapshot;
     const key = record.importKey;
@@ -117,13 +128,19 @@ export class ImportEngine {
     } catch {
       declaredSize = null;
     }
-    if (declaredSize !== null && declaredSize > MAX_FILE_BYTES) return this.reject('too_large');
+    if (declaredSize !== null && declaredSize > MAX_FILE_BYTES) {
+      await this.releaseSource(source.ref);
+      return this.reject('too_large');
+    }
 
     let copyRef: string;
     try {
       copyRef = await files.copyToPrivate(source.ref, MAX_FILE_BYTES);
     } catch (error) {
       return this.reject(error instanceof FileTooLargeError ? 'too_large' : 'unreadable');
+    } finally {
+      // From here on only our own size-capped copy is used.
+      await this.releaseSource(source.ref);
     }
 
     try {
@@ -205,6 +222,30 @@ export class ImportEngine {
       draft.errorCode = null;
     });
     await this.send(key);
+  }
+
+  /**
+   * Lets the user leave an import whose outcome is still unknown.
+   *
+   * One last lookup is made first: if the server has the job, nothing is
+   * abandoned and the normal job screen (with its delete button) takes over.
+   * Otherwise the key is remembered for later clean-up, the private copy is
+   * removed and the screen is freed. The caller must tell the user that a
+   * server-side import may exist and that its deletion cannot be confirmed now.
+   */
+  async abandonUncertain(): Promise<'recovered' | 'abandoned'> {
+    const record = this.record;
+    if (!record || record.phase !== 'uncertain') throw new EngineStateError('nothing to abandon');
+    const key = record.importKey;
+    if ((await this.recoverByKey(key)) === 'found') return 'recovered';
+    if (!this.current(key)) return 'abandoned';
+
+    const abandoned = await this.readAbandoned();
+    abandoned.push({ importKey: key, deleteKey: this.deps.newKey() });
+    await this.deps.store.setItem(ABANDONED_STORAGE_KEY, JSON.stringify(abandoned)); // before the record goes
+    this.log('import_abandoned');
+    await this.clearRecord();
+    return 'abandoned';
   }
 
   // ----------------------------------------------------------------- status
@@ -317,7 +358,14 @@ export class ImportEngine {
     if (!record) return;
     const finished = record.status === 'deleted' || record.phase === 'rejected' || record.phase === 'missing';
     if (!finished) throw new EngineStateError('the import still exists or its outcome is unknown');
-    if (record.copyRef !== null) await this.removeFile(record.copyRef);
+    await this.clearRecord();
+  }
+
+  // ---------------------------------------------------------------- private
+
+  private async clearRecord(): Promise<void> {
+    const copyRef = this.record?.copyRef ?? null;
+    if (copyRef !== null) await this.removeFile(copyRef);
     this.record = null;
     this.result = null;
     this.publish();
@@ -325,7 +373,63 @@ export class ImportEngine {
     this.log('record_cleared');
   }
 
-  // ---------------------------------------------------------------- private
+  private async readAbandoned(): Promise<AbandonedImport[]> {
+    try {
+      const value: unknown = JSON.parse((await this.deps.store.getItem(ABANDONED_STORAGE_KEY)) ?? '[]');
+      if (!Array.isArray(value)) return [];
+      return value.filter(
+        (entry): entry is AbandonedImport =>
+          typeof entry === 'object' && entry !== null &&
+          typeof (entry as AbandonedImport).importKey === 'string' &&
+          typeof (entry as AbandonedImport).deleteKey === 'string',
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Best-effort clean-up of abandoned imports, one pass per launch, GET first.
+   * An entry is dropped only when the server says there is no such job or that
+   * it is deleted; a job that exists gets a DELETE and is re-checked next launch.
+   */
+  private async cleanUpAbandoned(): Promise<void> {
+    const abandoned = await this.readAbandoned();
+    if (abandoned.length === 0) return;
+    const remaining: AbandonedImport[] = [];
+    for (const entry of abandoned) {
+      let settled = false;
+      try {
+        const lookup = await this.deps.http.request({
+          method: 'GET',
+          url: `${this.deps.baseUrl}/imports/by-key/${encodeURIComponent(entry.importKey)}`,
+          headers: {},
+          timeoutMs: this.requestTimeoutMs,
+        });
+        const view = lookup.status === 200 ? parseJobView(lookup.body) : null;
+        if (lookup.status === 404 || view?.status === 'deleted') {
+          settled = true;
+        } else if (view && view.status !== 'deleting') {
+          await this.deps.http.request({
+            method: 'DELETE',
+            url: `${this.deps.baseUrl}/imports/${encodeURIComponent(view.jobId)}`,
+            headers: { 'Idempotency-Key': entry.deleteKey },
+            timeoutMs: this.requestTimeoutMs,
+          });
+        }
+      } catch {
+        // unreachable: try again on the next launch
+      }
+      this.log('abandoned_cleanup', { reason: settled ? 'settled' : 'pending' });
+      if (!settled) remaining.push(entry);
+    }
+    try {
+      if (remaining.length === 0) await this.deps.store.removeItem(ABANDONED_STORAGE_KEY);
+      else await this.deps.store.setItem(ABANDONED_STORAGE_KEY, JSON.stringify(remaining));
+    } catch {
+      // the list stays as it was; clean-up repeats next launch
+    }
+  }
 
   private async send(key: string): Promise<void> {
     const record = this.current(key);
@@ -500,6 +604,14 @@ export class ImportEngine {
       if (ref === keep) continue;
       await this.removeFile(ref);
       this.log('orphan_copy_removed');
+    }
+  }
+
+  private async releaseSource(ref: string): Promise<void> {
+    try {
+      await this.deps.files.releaseSource(ref);
+    } catch {
+      // Retried by the orphan sweep on the next start.
     }
   }
 

@@ -3,7 +3,7 @@ import { copyFile, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { RECORD_STORAGE_KEY, type ImportEngine, type ImportRecord } from '../src/import';
+import { ABANDONED_STORAGE_KEY, RECORD_STORAGE_KEY, type ImportEngine, type ImportRecord } from '../src/import';
 import { createWorld, fixture, launch, startMock, type Mock, type World } from './support/harness';
 
 jest.setTimeout(30_000);
@@ -199,6 +199,70 @@ describe('relaunch', () => {
   });
 });
 
+describe('leaving an uncertain import', () => {
+  const offline = () => {
+    world.intercept = () => {
+      throw new Error('server unreachable');
+    };
+  };
+
+  it('does not abandon when the server turns out to have the job', async () => {
+    await mock.scenario('lost_ack');
+    const engine = launch(world, mock.baseUrl);
+    await startImport(engine, 'statement.csv');
+
+    expect(await engine.abandonUncertain()).toBe('recovered');
+    expect(record(engine)).toMatchObject({ phase: 'tracking', jobId: 'job-demo-001' });
+    expect(world.store.data.has(ABANDONED_STORAGE_KEY)).toBe(false);
+  });
+
+  it('keeps the key when the server is unreachable and deletes the server job on later launches', async () => {
+    await mock.scenario('lost_ack');
+    const engine = launch(world, mock.baseUrl);
+    await startImport(engine, 'statement.csv');
+    const key = record(engine).importKey;
+
+    offline();
+    expect(await engine.abandonUncertain()).toBe('abandoned');
+    expect(engine.getSnapshot().record).toBeNull();
+    expect(world.store.data.has(RECORD_STORAGE_KEY)).toBe(false);
+    expect(await world.files.listPrivate()).toEqual([]);
+    expect(world.store.data.get(ABANDONED_STORAGE_KEY)).toContain(key);
+    await expect(engine.abandonUncertain()).rejects.toThrow();
+
+    // Still offline on the next launch: nothing is forgotten.
+    await launch(world, mock.baseUrl).restore();
+    expect(world.store.data.get(ABANDONED_STORAGE_KEY)).toContain(key);
+
+    // Back online: the job is found by key and a DELETE is sent, but not yet trusted.
+    world.intercept = null;
+    await mock.scenario('happy');
+    await launch(world, mock.baseUrl).restore();
+    expect((await mock.state()).stats).toMatchObject({ newJobs: 1, deleteRequests: 1 });
+    expect(world.store.data.get(ABANDONED_STORAGE_KEY)).toContain(key);
+
+    // A later launch sees `deleted` from the server and only then drops the key.
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    await launch(world, mock.baseUrl).restore();
+    expect((await mock.state()).jobs[0].status).toBe('deleted');
+    expect(world.store.data.has(ABANDONED_STORAGE_KEY)).toBe(false);
+    const deletes = world.requests('DELETE');
+    expect(new Set(deletes.map(entry => entry.headers['Idempotency-Key'])).size).toBe(1);
+  });
+
+  it('drops the key once the server says no such job exists', async () => {
+    offline();
+    const engine = launch(world, mock.baseUrl);
+    await startImport(engine, 'statement.csv'); // the POST never left the device
+    expect(await engine.abandonUncertain()).toBe('abandoned');
+
+    world.intercept = null;
+    await launch(world, mock.baseUrl).restore();
+    expect(world.store.data.has(ABANDONED_STORAGE_KEY)).toBe(false);
+    expect((await mock.state()).stats).toMatchObject({ createRequests: 0, deleteRequests: 0 });
+  });
+});
+
 describe('stale_status', () => {
   it('keeps ready/revision 3 when processing/revision 2 arrives afterwards', async () => {
     const engine = launch(world, mock.baseUrl);
@@ -342,6 +406,22 @@ describe('spoofed + oversize', () => {
     expect(await blind.files.listPrivate()).toEqual([]);
     expect((await mock.state()).stats.createRequests).toBe(0);
     await blind.cleanup();
+  });
+
+  it('releases the picked source in every outcome so a system-made copy never lingers', async () => {
+    const engine = launch(world, mock.baseUrl);
+    for (const name of ['spoofed.pdf', 'oversize.csv']) {
+      await engine.prepare({ ref: fixture(name), name });
+    }
+    const accepted = await engine.prepare({ ref: fixture('statement.csv'), name: 'statement.csv' });
+    expect(accepted.ok).toBe(true);
+    expect(world.files.released).toEqual(['spoofed.pdf', 'oversize.csv', 'statement.csv'].map(fixture));
+
+    const blind = await createWorld({ sizeKnown: false });
+    await launch(blind, mock.baseUrl).prepare({ ref: fixture('oversize.csv'), name: 'oversize.csv' });
+    expect(blind.files.released).toEqual([fixture('oversize.csv')]);
+    await blind.cleanup();
+    if (accepted.ok) await engine.discard(accepted.candidate);
   });
 
   it('rejects a real CSV renamed to .pdf', async () => {
